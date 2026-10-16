@@ -1,0 +1,1400 @@
+#!/usr/bin/env python3
+"""bp_anyrun — ANY.RUN sandbox client for BinaryPivot: gated submission, task reads, TI Lookup.
+
+WHAT THIS API ACTUALLY IS
+-------------------------
+The ANY.RUN API is a SANDBOX-SUBMISSION API. Its centre of gravity is `POST /v1/analysis`: hand it
+a file or a URL, it detonates it in an interactive VM and returns a task with the network log,
+dropped files and a verdict. **Threat Intelligence Lookup — searching other people's detonations
+without running your own — is a separate and comparatively limited product**: its own licence, a
+small request allowance, and absent entirely from a plain sandbox subscription. So TI Lookup is
+treated here as a bonus for when the licence exists (`keycheck --probe` settles whether it does —
+the license endpoint alone false-greens a sandbox key), and the
+sandbox is the layer's real surface.
+
+SUBMISSION IS AN OPSEC DECISION, AND IT IS ALWAYS THE ANALYST'S
+----------------------------------------------------------------
+A lookup asks a question. A submission takes the analyst's case material, hands it to a third
+party, and then reaches out and TOUCHES the target from a fingerprintable sandbox. Both halves can
+burn an investigation and neither is reversible — deleting the task afterwards does not un-send the
+sample and does not un-notify the operator. Concretely:
+
+  - **public exposure** — on a free plan every submission is world-readable and searchable: sample,
+    URL, screenshots, network log. Operators monitor that feed for their own domains and hashes.
+  - **tipping the operator** — a URL detonation FETCHES the live target from published ANY.RUN
+    egress ranges. The operator sees a known sandbox hit their funnel, and rotates or cloaks.
+  - **a poisoned verdict** — the same filtering means a clean result may just be the decoy these
+    funnels serve to datacenter IPs. `info` is not exoneration.
+  - **third-party data handling** — the sample may carry victim PII or client data.
+
+So this module **never submits without explicit, per-submission confirmation**. `submit()` refuses
+unless `confirm=True` is passed and returns `submit_preflight()` — the risk briefing plus the
+cheaper alternatives — instead. Nothing in the collector path can reach it: `analyze_artifact` does
+static extraction and lookups only. Privacy defaults to `owner`, `public` is refused outright, and
+a free-plan submission is refused rather than silently downgraded to a public one. The policy is
+DATA (`references/anyrun.json -> submission_policy`), so an analyst can tighten it without touching
+code — but `require_explicit_confirmation` is enforced in the function signature, not read from the
+file, because a config edit must not be able to turn the gate off.
+
+WHAT THE LOOKUP SIDE ADDS THAT STATIC ANALYSIS CANNOT
+------------------------------------------------------
+`analyze_artifact.py` reads what a sample IS. ANY.RUN reports what samples like it DID when they
+were detonated: the domains and IPs actually contacted, the family label, the Suricata alerts, and
+the public sandbox sessions an analyst can open and watch. Three consequences for casework:
+
+  - **it recovers infrastructure static extraction never sees.** A backend host assembled at
+    runtime, or decrypted out of a packed payload, is absent from the strings sweep by
+    construction — but it is right there in the network log of any detonation. This is the direct
+    answer to a `binary:protection` finding: when the string sweep is thin BECAUSE the sample is
+    protected, the sandbox record is where the operator's real endpoints live.
+  - **it is an observation, not a reputation score.** `domainName` / `destinationIP` hits mean a
+    sample *contacted* that host. That is a far stronger statement than "this string appears in
+    the file", and it joins straight onto the web case: those hosts go back into WebPivot.
+  - **it dates the behaviour.** Task timestamps give the campaign's active window from a corpus
+    that is independent of WHOIS, CT and the archive.
+
+WHAT IT DOES NOT PROVE — READ BEFORE CLUSTERING
+-----------------------------------------------
+A shared **threat family** is a same-KIT signal, exactly like a shared packer or a shared
+white-label CDN: two unrelated crews running the same commodity stealer are not one crew. And half
+of what any detonation contacts is shared internet furniture. `references/anyrun.json ->
+clustering_policy` fixes which fields may carry an operator edge (`domainName`, `destinationIP`,
+`url`, `jarm`) and which are context only; `grade_field()` stamps that judgement onto every result
+so the distinction survives into the case file.
+
+KEYLESS IS A SUPPORTED MODE — AND IT IS ABOUT HALF THE LAYER
+-------------------------------------------------------------
+With no `ANYRUN_API_KEY` this module still writes the correct TI Lookup query for every artifact
+the analysis produced (choosing the right observation field, splitting an `ip:port` into
+destinationIP + destinationPort, bounding the time window) and hands over the UI address to paste
+it into, plus the public-task links. Composing the query is most of the tradecraft, and it costs
+nothing. What is lost is running it: the related domains/IPs/URLs, the family label, the task list,
+and any automatic feedback of discovered infrastructure into the case. `capability()` reports that
+as **~50% of full capability** and the banner says it out loud — because an absent ANY.RUN section
+must never read as "this sample is unknown to the sandbox world".
+
+REQUESTS ARE METERED
+--------------------
+A TI Lookup trial is tens of requests, not thousands. Spend is counted from the shared
+`MEMORY/api_usage.jsonl` ledger and capped before the call, per run and per month; thresholds are
+DATA (`references/anyrun.json -> request_budget`), overridable with `ANYRUN_MAX_REQUESTS_PER_RUN` /
+`ANYRUN_MONTHLY_REQUESTS`.
+
+Auth: `ANYRUN_API_KEY`, sent as `Authorization: API-KEY <key>` (a bare key is fine — the prefix is
+added). TI Lookup is a SEPARATE licence from the sandbox: a sandbox-only key answers 401/403 on
+`/intelligence/*`, which this module reports as an entitlement fact, not as an error.
+
+CLI:
+  python3 bp_anyrun.py query file:sha256 <hash>     # OFFLINE — builds the query + UI link, no key
+  python3 bp_anyrun.py lookup --sha256 <hash>       # TI Lookup (needs the separate licence)
+  python3 bp_anyrun.py lookup --domain backend.example.com [--days 90]
+  python3 bp_anyrun.py history [--limit 20]         # YOUR OWN past tasks
+  python3 bp_anyrun.py report <task-uuid> [--iocs]  # one task's report / IOC set
+  python3 bp_anyrun.py submit ./sample.bin          # prints the RISK BRIEFING and refuses
+  python3 bp_anyrun.py submit ./sample.bin --confirm-submission   # actually detonates
+  python3 bp_anyrun.py keycheck [--probe]           # TI-Lookup check (advisory; --probe settles it, free unless entitled)
+  python3 bp_anyrun.py budget                       # OFFLINE — this month's request spend
+"""
+import argparse
+import copy
+import datetime
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import bp_refs  # noqa: E402 — reference DATA lives in references/*.json (RULE 3)
+
+# The licensed-API ledger lives with WebPivot (one ledger for every metered call in the toolkit —
+# CLAUDE.md § Cost visibility). BinaryPivot is imported standalone on other machines, so the import
+# is best-effort: inside the repo we reuse api_usage.record; outside it we append the SAME JSONL
+# schema ourselves rather than silently losing the spend record.
+try:
+    import api_usage
+except Exception:
+    api_usage = None
+    _sib = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         os.pardir, os.pardir, "WebPivot", "tools"))
+    if os.path.isdir(_sib):
+        sys.path.append(_sib)
+        try:
+            import api_usage  # noqa: F811
+        except Exception:
+            api_usage = None
+
+DEFAULT_UA = "Mozilla/5.0 (compatible; BinaryPivot/1.0)"
+
+# --- reference DATA (RULE 3). The fallback is the minimum that keeps the KEYLESS query builder
+#     correct if the JSON goes missing — load_ref warns loudly when it does.
+_ANYRUN_FALLBACK = {
+    "endpoints": {"api_base": "https://api.any.run/v1", "report_base": "https://api.any.run/report",
+                  "submit_analysis": "/analysis",
+                  "ti_search": "/intelligence/api/search", "ti_keycheck": "/intelligence/keycheck",
+                  "analysis_history": "/analysis", "analysis_report": "/analysis/{id}",
+                  "report_ioc": "/{id}/ioc/json", "user_limits": "/user"},
+    "privacy_types": {"owner": "only you"},
+    # The fallback is the STRICT end of the policy on purpose: if the data file is unreadable the
+    # gate must still hold. `require_explicit_confirmation` is enforced in code regardless.
+    "submission_policy": {"require_explicit_confirmation": True, "default_privacy": "owner",
+                          "forbidden_privacy": ["public"], "refuse_on_free_plan": True,
+                          "default_auto_delete_after": "week",
+                          "risks": ["a submission is outbound, attributable and irreversible — it "
+                                    "may expose the sample publicly and tells the target it is "
+                                    "being sandboxed"],
+                          "preflight_checks": ["run the static analysis first",
+                                               "look for an EXISTING detonation of this hash"],
+                          "never_send": ["case IDs", "analyst or client names"]},
+    "query_fields": {"sha256": "file hash", "domainName": "a domain contacted during detonation",
+                     "destinationIP": "an IP contacted during detonation",
+                     "destinationPort": "the port of that connection", "url": "a full URL requested"},
+    "pivot_field_map": {"file:sha256": "sha256", "app:backend_host": "domainName",
+                        "app:c2_endpoint": "destinationIP", "domain": "domainName",
+                        "ip": "destinationIP", "url": "url"},
+    "verdict_levels": {},
+    "plan_capabilities": {"none": {"ti_lookup": False, "sandbox_api": False}},
+    # Deliberately the CONSERVATIVE minimum: a broken data file must never unlock a bigger spend.
+    "request_budget": {"monthly_requests": 50, "max_requests_per_run": 10, "warn_at_remaining": 10,
+                       "lookup_costs": 1, "block_when_exhausted": True},
+    "result_limits": {"max_tasks": 25, "max_related_indicators": 100, "lookup_days": 180},
+    "ui_templates": {"lookup_ui": "https://intelligence.any.run/analysis/lookup",
+                     "public_task": "https://app.any.run/tasks/{id}",
+                     "submissions": "https://app.any.run/submissions"},
+    # Fails CLOSED: with no readable policy nothing is clusterable, which costs leads but never
+    # manufactures an operator link out of a shared malware family.
+    "clustering_policy": {"cluster_on": [], "context_only": []},
+}
+_REFS = bp_refs.load_ref(bp_refs.ref_path(__file__, "anyrun.json"), _ANYRUN_FALLBACK)
+ENDPOINTS = _REFS["endpoints"]
+PRIVACY_TYPES = _REFS["privacy_types"]
+SUBMISSION_POLICY = _REFS["submission_policy"]
+QUERY_FIELDS = _REFS["query_fields"]
+PIVOT_FIELD_MAP = _REFS["pivot_field_map"]
+VERDICT_LEVELS = _REFS["verdict_levels"]
+PLAN_CAPABILITIES = _REFS["plan_capabilities"]
+REQUEST_BUDGET = _REFS["request_budget"]
+RESULT_LIMITS = _REFS["result_limits"]
+UI_TEMPLATES = _REFS["ui_templates"]
+CLUSTERING_POLICY = _REFS["clustering_policy"]
+
+_MEMO = {}
+_MEMO_LOCK = threading.Lock()
+
+# Master off switch, flipped by `analyze_artifact --no-anyrun`. Only the NETWORK calls honour it —
+# the query builder is offline and free, so it keeps emitting queries either way.
+ENABLED = True
+
+
+def _load_env_files():
+    """Populate os.environ from the same .env candidates WebPivot reads, so a key stored via
+    /apikeys — which writes the skill-root .env — is visible to BinaryPivot too. Env always wins
+    (a set var is never overridden); an earlier file wins over a later one. BinaryPivot ships
+    standalone, so this mirrors wp_common._load_customization_env locally rather than importing it."""
+    sd = os.path.dirname(os.path.abspath(__file__))
+    intel_engine = os.path.dirname(os.path.dirname(sd))      # tools -> BinaryPivot -> intel_engine
+    skill_root = os.path.dirname(intel_engine)               # -> skill root (where /apikeys writes)
+    seen = set()
+    cands = [
+        os.environ.get("CTI_API_KEYS_ENV") or os.environ.get("CTI_WEBPIVOT_ENV"),
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(skill_root, ".env"),
+        os.path.join(intel_engine, ".env"),
+        os.path.expanduser("~/.config/cti-expert/WebPivot/.env"),
+    ]
+    for p in cands:
+        if not p or p in seen or not os.path.isfile(p):
+            continue
+        seen.add(p)
+        try:
+            with open(p, encoding="utf-8") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln or ln.startswith("#") or "=" not in ln:
+                        continue
+                    k, v = ln.split("=", 1)
+                    k, v = k.strip(), v.strip().strip('"').strip("'")
+                    if k and v and k not in os.environ:
+                        os.environ[k] = v
+        except Exception:
+            pass
+
+
+_ENV_LOADED = False
+
+
+def _secret(*names):
+    """First non-empty environment variable among `names`, else None (same contract as WebPivot's
+    `wp_common._secret`). Lazily loads the skill-root .env on first use so a key stored via
+    /apikeys is seen even though BinaryPivot ships standalone."""
+    global _ENV_LOADED
+    if not _ENV_LOADED:
+        _load_env_files()
+        _ENV_LOADED = True
+    for n in names:
+        v = os.environ.get(n)
+        if v and v.strip():
+            return v.strip()
+    return None
+
+
+def uniq(seq):
+    seen, out = set(), []
+    for x in seq:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+# --------------------------------------------------------------------------- auth / transport
+def anyrun_key():
+    """The ANY.RUN API key, or None."""
+    return _secret("ANYRUN_API_KEY", "ANY_RUN_API_KEY", "ANYRUN_KEY")
+
+
+def anyrun_configured() -> bool:
+    return ENABLED and bool(anyrun_key())
+
+
+def public_standing_authorized() -> bool:
+    """True when the analyst has recorded a STANDING authorization for PUBLIC sandbox tasks —
+    `ANYRUN_ALLOW_PUBLIC=1` in the environment or the gitignored .env. It is the analyst's own
+    durable word (same shape as HARNESS_ALLOW_SUBMIT), meant for accounts whose plan can only
+    create public tasks; it never relaxes the per-submission confirmation gate."""
+    v = _secret("ANYRUN_ALLOW_PUBLIC")
+    return bool(v) and v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _headers():
+    h = {"User-Agent": DEFAULT_UA, "Accept": "application/json"}
+    key = anyrun_key()
+    if key:
+        # ANY.RUN expects `API-KEY <key>`; analysts paste the bare key as often as the prefixed
+        # form, and sending the bare one is an opaque 401 rather than a useful error.
+        h["Authorization"] = key if key.lower().startswith(("api-key ", "basic ")) else f"API-KEY {key}"
+    return h
+
+
+_STATUS_REASON = {
+    400: "ANY.RUN rejected the query — check the field name against references/anyrun.json -> "
+         "query_fields (TI Lookup is field:\"value\", not free text)",
+    401: "ANY.RUN rejected the key (ANYRUN_API_KEY missing or expired)",
+    403: "your ANY.RUN plan does not include this endpoint — TI Lookup is a SEPARATE licence from "
+         "the sandbox, so a sandbox key cannot query /intelligence/*",
+    404: "not in the ANY.RUN dataset",
+    429: "ANY.RUN rate limit",
+}
+
+
+def _call(url: str, *, method: str = "GET", body: dict = None, timeout: int = 30):
+    """One ANY.RUN API call -> (data, error_dict). Never raises.
+
+    `error_dict` is `{"skipped": reason}` for the entitlement/auth/quota conditions the caller is
+    expected to survive, `{"error": ...}` for anything genuinely unexpected."""
+    if not anyrun_configured():
+        return None, {"skipped": "no ANYRUN_API_KEY configured"}
+    data = json.dumps(body).encode() if body is not None else None
+    headers = _headers()
+    if data:
+        headers["Content-Type"] = "application/json"
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r), None
+    except urllib.error.HTTPError as e:
+        reason = _STATUS_REASON.get(e.code)
+        msg = f"HTTP {e.code}" + (f" — {reason}" if reason else "")
+        if e.code in _STATUS_REASON:
+            return None, {"skipped": msg}
+        return None, {"error": msg}
+    except Exception as e:
+        return None, {"error": str(e)}
+
+
+def _log_path():
+    if api_usage:
+        return api_usage._log_path()
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    return _secret("API_USAGE_LOG") or os.path.join(root, "MEMORY", "api_usage.jsonl")
+
+
+def _record(action: str, credits: int, query: str, results=None, ok: bool = True):
+    """Log one metered ANY.RUN call (CLAUDE.md: every licensed API call is recorded)."""
+    if credits:
+        _spend(credits)
+    if api_usage:
+        api_usage.record("anyrun", action, credits=credits, query=query, results=results, ok=ok)
+        return
+    rec = {"ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "provider": "anyrun", "action": action, "credits": (credits if ok else 0),
+           "query": (str(query)[:200] if query else None), "results": results, "ok": ok,
+           "case": None, "skill": "binarypivot"}
+    try:
+        p = _log_path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- request BUDGET guard
+_RUN_SPENT = 0
+_MONTH_SPENT = None
+_WARNED = set()
+_BUDGET_LOCK = threading.Lock()
+
+
+def _budget(key: str, env: str = None, default=0):
+    if env:
+        raw = _secret(env)
+        if raw:
+            try:
+                return int(float(raw))
+            except ValueError:
+                print(f"[anyrun] WARNING: {env}={raw!r} is not a number; using the reference value.",
+                      file=sys.stderr)
+    return REQUEST_BUDGET.get(key, default)
+
+
+def month_spent(refresh: bool = False) -> int:
+    """ANY.RUN requests already spent this UTC month, from the shared ledger — every tool and every
+    case, since the allowance is per account. Unreadable ledger -> 0."""
+    global _MONTH_SPENT
+    with _BUDGET_LOCK:
+        if _MONTH_SPENT is not None and not refresh:
+            return _MONTH_SPENT
+    month = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
+    total = 0
+    try:
+        with open(_log_path(), encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or '"anyrun"' not in line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("provider") == "anyrun" and (rec.get("ts") or "").startswith(month):
+                    total += rec.get("credits") or 0
+    except FileNotFoundError:
+        total = 0
+    except Exception as exc:
+        print(f"[anyrun] WARNING: could not read the usage ledger ({exc}); the monthly guard is "
+              f"running on this process's spend only.", file=sys.stderr)
+        total = 0
+    with _BUDGET_LOCK:
+        _MONTH_SPENT = total
+    return total
+
+
+def _spend(n: int) -> None:
+    global _RUN_SPENT, _MONTH_SPENT
+    with _BUDGET_LOCK:
+        _RUN_SPENT += n
+        if _MONTH_SPENT is not None:
+            _MONTH_SPENT += n
+
+
+def budget_status() -> dict:
+    limit = _budget("monthly_requests", "ANYRUN_MONTHLY_REQUESTS", 50)
+    run_cap = _budget("max_requests_per_run", "ANYRUN_MAX_REQUESTS_PER_RUN", 10)
+    spent = month_spent()
+    return {"monthly_requests": limit, "spent_this_month": spent,
+            "remaining_this_month": max(0, limit - spent),
+            "spent_this_run": _RUN_SPENT, "max_requests_per_run": run_cap,
+            "ledger": _log_path(),
+            "month": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")}
+
+
+def _budget_block(cost: int, action: str):
+    """None when `cost` requests may be spent, else the analyst-readable reason not to. Returned as
+    a `skipped` reason — the built query and its UI link remain the deliverable."""
+    if not REQUEST_BUDGET.get("block_when_exhausted", True):
+        return None
+    b = budget_status()
+    if b["spent_this_run"] + cost > b["max_requests_per_run"]:
+        return (f"per-run ANY.RUN cap reached ({b['spent_this_run']}/{b['max_requests_per_run']} "
+                f"requests this run; {action} needs {cost}). Raise ANYRUN_MAX_REQUESTS_PER_RUN, or "
+                f"paste the emitted query into the TI Lookup UI.")
+    if cost > b["remaining_this_month"]:
+        return (f"monthly ANY.RUN allowance exhausted ({b['spent_this_month']}/"
+                f"{b['monthly_requests']} in {b['month']}; {action} needs {cost}). Raise "
+                f"ANYRUN_MONTHLY_REQUESTS if your licence is larger.")
+    if b["remaining_this_month"] <= _budget("warn_at_remaining", default=10) and action not in _WARNED:
+        _WARNED.add(action)
+        print(f"[anyrun] ⚠ {b['remaining_this_month']} of {b['monthly_requests']} monthly TI Lookup "
+              f"requests left. Spending {cost} on {action}.", file=sys.stderr)
+    return None
+
+
+def _memoised(kind: str, ident: str, fn):
+    key = (kind, ident)
+    with _MEMO_LOCK:
+        if key in _MEMO:
+            return copy.deepcopy(_MEMO[key])
+    val = fn()
+    with _MEMO_LOCK:
+        _MEMO[key] = val
+    return copy.deepcopy(val)
+
+
+# --------------------------------------------------------------------------- query BUILDER (keyless)
+def field_for_kind(kind: str):
+    """BinaryPivot pivot `kind` -> the TI Lookup field that reverses it, honouring `prefix:`
+    entries. None when the sandbox does not index the artifact — which is the right answer for a
+    signing certificate, an APK package name or a firebase project id."""
+    if not kind:
+        return None
+    if kind in PIVOT_FIELD_MAP:
+        return PIVOT_FIELD_MAP[kind]
+    for pref, field in PIVOT_FIELD_MAP.items():
+        if pref.endswith(":") and kind.startswith(pref):
+            return field
+    return None
+
+
+def build_query(kind: str, value) -> str:
+    """The TI Lookup query string for one artifact, or "" when ANY.RUN cannot reverse it.
+
+    `app:c2_endpoint` is the one special case: an `ip:port` value is split into
+    destinationIP + destinationPort so the query matches the CONNECTION rather than a literal
+    string that would never appear in the index."""
+    field = field_for_kind(kind)
+    if not field:
+        return ""
+    val = str(value or "").strip()
+    if not val:
+        return ""
+    if field == "destinationIP" and ":" in val and val.count(":") == 1:
+        ip, _, port = val.partition(":")
+        if port.isdigit():
+            return f'destinationIP:"{ip}" AND destinationPort:"{port}"'
+        val = ip
+    return f'{field}:"{val}"'
+
+
+def anyrun_queries(kind: str, value, ui: bool = True) -> list:
+    """Ready-to-run ANY.RUN entries for a pivot's `queries` list. [] when the sandbox does not
+    index the artifact. Pure string building — keyless-safe and free."""
+    q = build_query(kind, value)
+    if not q:
+        return []
+    out = [{"service": "ANY.RUN TI Lookup", "query": q}]
+    if ui:
+        # TI Lookup has no shareable query URL, so the honest keyless deliverable is the UI address
+        # plus the exact query text to paste into it.
+        out.append({"service": "ANY.RUN TI Lookup UI (paste the query above)",
+                    "query": UI_TEMPLATES.get("lookup_ui", "https://intelligence.any.run/analysis/lookup")})
+    return out
+
+
+def attach_anyrun_queries(pivots: list) -> list:
+    """Append the TI Lookup query (+ the UI link) to every pivot whose kind ANY.RUN can reverse.
+
+    One pass over the finished pivot list, so `references/anyrun.json -> pivot_field_map` is the
+    single place an analyst edits to teach BinaryPivot a new lookup field. Mutates and returns
+    `pivots`."""
+    for piv in pivots or []:
+        if any("ANY.RUN" in (q.get("service") or "") for q in (piv.get("queries") or [])):
+            continue
+        qs = anyrun_queries(piv.get("kind"), piv.get("value"))
+        if qs:
+            piv.setdefault("queries", []).extend(qs)
+    return pivots
+
+
+def task_url(task_id: str) -> str:
+    """The public sandbox session for a task uuid — the link a report cites so a reader can watch
+    the detonation instead of taking our word for it."""
+    tpl = UI_TEMPLATES.get("public_task", "https://app.any.run/tasks/{id}")
+    return tpl.replace("{id}", urllib.parse.quote(str(task_id or ""), safe=""))
+
+
+# --------------------------------------------------------------------------- result grading
+def grade_field(field: str) -> str:
+    """`cluster` | `context` | `ungraded` — whether a hit on this TI Lookup field may support a
+    same-operator edge. Fails closed: an unknown field is never clusterable."""
+    f = (field or "").strip()
+    if f in (CLUSTERING_POLICY.get("cluster_on") or []):
+        return "cluster"
+    if f in (CLUSTERING_POLICY.get("context_only") or []):
+        return "context"
+    return "ungraded"
+
+
+def _rows(node, *keys):
+    """Pull a list out of whichever container ANY.RUN wrapped it in. The lookup response has been
+    reshaped by ANY.RUN more than once, so every extraction here is defensive: a field we cannot
+    find is reported empty, never as an exception in the middle of a case."""
+    if not isinstance(node, dict):
+        return []
+    for k in keys:
+        v = node.get(k)
+        if isinstance(v, list):
+            return v
+    return []
+
+
+def summarise_lookup(data: dict) -> dict:
+    """A TI Lookup response -> the operator-relevant subset, each indicator carrying its grade.
+
+    Keeps the network observations (domains, IPs, URLs) because those are the ones that go back
+    into WebPivot, plus the summary verdict and the task links that let a reader verify."""
+    if not isinstance(data, dict):
+        return {}
+    body = data.get("data") if isinstance(data.get("data"), dict) else data
+    cap = int(RESULT_LIMITS.get("max_related_indicators", 100))
+    summary = body.get("summary") if isinstance(body.get("summary"), dict) else {}
+
+    def _vals(rows, key):
+        return uniq([r.get(key) for r in rows if isinstance(r, dict) and r.get(key)])[:cap]
+
+    dns_rows = _rows(body, "relatedDNS", "domainName")
+    ip_rows = _rows(body, "destinationIP", "relatedIP")
+    url_rows = _rows(body, "relatedURLs", "url")
+    threats = uniq([t for r in (dns_rows + ip_rows + url_rows) if isinstance(r, dict)
+                    for t in (r.get("threatName") or [])])
+    tasks = _rows(body, "relatedTasks", "sourceTasks", "tasks")
+    task_ids = uniq([t.get("uuid") or t.get("related") or t.get("taskId")
+                     for t in tasks if isinstance(t, dict)])[:int(RESULT_LIMITS.get("max_tasks", 25))]
+    out = {
+        "threat_level": summary.get("threatLevel"),
+        "last_seen": summary.get("lastSeen"),
+        "tags": summary.get("tags") or [],
+        "domains": _vals(dns_rows, "domainName"),
+        "ips": _vals(ip_rows, "destinationIP"),
+        "urls": _vals(url_rows, "url"),
+        "ports": uniq(body.get("destinationPort") or [])[:cap],
+        "countries": uniq(body.get("destinationIPgeo") or [])[:cap],
+        "asns": uniq([a.get("asn") for a in _rows(body, "destinationIpAsn") if isinstance(a, dict)])[:cap],
+        "related_files": [f.get("hashes", {}).get("sha256") for f in _rows(body, "relatedFiles")
+                          if isinstance(f, dict) and f.get("hashes")][:cap],
+        "threat_names": threats[:cap],
+        "task_urls": [task_url(t) for t in task_ids if t],
+    }
+    out = {k: v for k, v in out.items() if v not in (None, [], "")}
+    if out.get("domains") or out.get("ips") or out.get("urls"):
+        out["clusterable"] = ("domains / ips / urls are OBSERVED CONTACTS and may support an "
+                              "operator edge once corroborated")
+    if out.get("threat_names"):
+        out["kit_level_only"] = ("threat_names group by malware FAMILY, not by operator — a shared "
+                                 "family is a same-KIT signal, never attribution on its own")
+    return out
+
+
+# --------------------------------------------------------------------------- TI Lookup
+def _window(days: int = None):
+    d = int(days or RESULT_LIMITS.get("lookup_days", 180))
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    return (today - datetime.timedelta(days=d)).isoformat(), today.isoformat()
+
+
+def ti_lookup(query: str, days: int = None, timeout: int = 45):
+    """Run a raw TI Lookup query -> the summarised observation set.
+
+    Returns None with no key. `{"skipped": …}` when the licence or the budget says no — in which
+    case the query string itself is still the deliverable and its absence of results says NOTHING
+    about the sample."""
+    if not anyrun_configured():
+        return None
+    q = (query or "").strip()
+    if not q:
+        return {"error": "empty query"}
+    cost = int(REQUEST_BUDGET.get("lookup_costs", 1))
+    start, end = _window(days)
+
+    def run():
+        blocked = _budget_block(cost, "TI Lookup")
+        if blocked:
+            return {"skipped": blocked, "query": q, "ui_url": UI_TEMPLATES.get("lookup_ui"),
+                    "budget": budget_status()}
+        url = ENDPOINTS.get("api_base", "https://api.any.run/v1") + \
+            ENDPOINTS.get("ti_search", "/intelligence/api/search")
+        data, err = _call(url, method="POST",
+                          body={"query": q, "startDate": start, "endDate": end}, timeout=timeout)
+        if err:
+            _record("ti_lookup", 0, q, ok=False)
+            return dict(err, query=q, ui_url=UI_TEMPLATES.get("lookup_ui"))
+        res = summarise_lookup(data)
+        _record("ti_lookup", cost, q,
+                results=len(res.get("domains", [])) + len(res.get("ips", [])))
+        return dict(res, query=q, window={"from": start, "to": end},
+                    ui_url=UI_TEMPLATES.get("lookup_ui"))
+    return _memoised("ti_lookup", f"{q}|{start}", run)
+
+
+def lookup_artifact(kind: str, value, days: int = None):
+    """TI Lookup for one BinaryPivot artifact, by pivot kind. `{"skipped": …}` when ANY.RUN does
+    not index that kind — a fact about the sandbox, not about the sample."""
+    q = build_query(kind, value)
+    if not q:
+        return {"skipped": f"ANY.RUN does not index {kind} — no observation field maps to it",
+                "kind": kind, "value": value}
+    return ti_lookup(q, days=days)
+
+
+def keycheck(probe: bool = False, timeout: int = 20):
+    """Report TI-Lookup entitlement — TRUTHFULLY.
+
+    DEFAULT (free, no spend): queries /intelligence/keycheck, the LICENCE endpoint. That only
+    confirms the licence record answers; it does NOT prove /intelligence/api/search is authorised.
+    A sandbox-only key passes keycheck yet 403s on the real search, so the default result is
+    ADVISORY — `entitled` is None and the note says to run --probe to settle it. (The old behaviour
+    of returning entitled=True off this endpoint was a false green; see keycheck --probe.)
+
+    --probe (AUTHORITATIVE): issues the MINIMAL real TI search. A sandbox-only key 403s — which
+    costs nothing — so the probe is free in exactly the false-green case; it consumes 1 TI request
+    ONLY when the licence genuinely exists and the search returns 200, and that spend is recorded
+    on the shared ledger."""
+    if not anyrun_configured():
+        return None
+
+    def run():
+        base = ENDPOINTS.get("api_base", "https://api.any.run/v1")
+        lic_url = base + ENDPOINTS.get("ti_keycheck", "/intelligence/keycheck")
+        lic_data, lic_err = _call(lic_url, timeout=timeout)
+        license_valid = lic_err is None
+        out = {"license_valid": license_valid,
+               "license_response": lic_data if license_valid else lic_err}
+        if not probe:
+            out["entitled"] = None
+            out["note"] = (
+                ("license endpoint says valid" if license_valid
+                 else "license endpoint did not validate")
+                + " — this does NOT confirm TI-Lookup access: a sandbox-only key can pass here yet "
+                "403 on the real search. Run `keycheck --probe` to settle it (free if not entitled; "
+                "costs 1 request only if it is).")
+            return out
+        # AUTHORITATIVE: hit the real search endpoint. 401/403 -> not entitled and FREE; a 200 ->
+        # entitled and 1 TI request spent, recorded on the ledger.
+        start, end = _window(1)
+        s_url = base + ENDPOINTS.get("ti_search", "/intelligence/api/search")
+        data, err = _call(s_url, method="POST",
+                          body={"query": 'domainName:"any.run"', "startDate": start, "endDate": end},
+                          timeout=timeout)
+        if err:
+            reason = err.get("skipped") or err.get("error") or "unknown"
+            entitled = False if ("403" in reason or "401" in reason) else None
+            _record("keycheck_probe", 0, "keycheck", ok=False)
+            out.update({"entitled": entitled, "probe": reason})
+            return out
+        _record("keycheck_probe", int(REQUEST_BUDGET.get("lookup_costs", 1)), "keycheck",
+                results=0, ok=True)
+        out.update({"entitled": True,
+                    "probe": "HTTP 200 — /intelligence/api/search authorised (1 TI request spent)"})
+        return out
+    return _memoised("keycheck", "probe" if probe else "self", run)
+
+
+# --------------------------------------------------------------------------- sandbox READS
+def analysis_history(limit: int = 25, skip: int = 0, timeout: int = 30):
+    """YOUR OWN past tasks. Read-only and free of the submission gate — and the first thing to
+    check before detonating anything, because the answer is often already in your history."""
+    if not anyrun_configured():
+        return None
+    url = (ENDPOINTS.get("api_base", "https://api.any.run/v1")
+           + ENDPOINTS.get("analysis_history", "/analysis")
+           + f"?limit={max(1, min(100, int(limit)))}&skip={max(0, int(skip))}")
+
+    def run():
+        data, err = _call(url, timeout=timeout)
+        if err:
+            return dict(err)
+        rows = ((data or {}).get("data") or {}).get("tasks") or []
+        out = []
+        for t in rows if isinstance(rows, list) else []:
+            if not isinstance(t, dict):
+                continue
+            out.append({k: v for k, v in {
+                "uuid": t.get("uuid"), "verdict": t.get("verdict"),
+                "name": (t.get("related") or t.get("name")), "date": t.get("date"),
+                "task_url": task_url(t.get("uuid") or ""),
+            }.items() if v})
+        return {"tasks": out, "count": len(out)}
+    return _memoised("history", f"{limit}|{skip}", run)
+
+
+def analysis_report(task_uuid: str, iocs: bool = False, timeout: int = 45):
+    """One task's report, or its IOC set with `iocs=True`. Read-only."""
+    if not anyrun_configured():
+        return None
+    base = ENDPOINTS.get("api_base", "https://api.any.run/v1")
+    if iocs:
+        url = (ENDPOINTS.get("report_base", "https://api.any.run/report")
+               + ENDPOINTS.get("report_ioc", "/{id}/ioc/json").replace("{id}", str(task_uuid)))
+    else:
+        url = base + ENDPOINTS.get("analysis_report", "/analysis/{id}").replace("{id}", str(task_uuid))
+
+    def run():
+        data, err = _call(url, timeout=timeout)
+        if err:
+            return dict(err, task_uuid=task_uuid)
+        return {"task_uuid": task_uuid, "task_url": task_url(task_uuid),
+                "report": (data or {}).get("data") or data}
+    return _memoised("report", f"{task_uuid}|{iocs}", run)
+
+
+# --------------------------------------------------------------------------- submission (GATED)
+def submit_preflight(target: str, kind: str = "file") -> dict:
+    """The briefing an analyst must see BEFORE a submission — never a step that can be skipped.
+
+    Returned by `submit()` whenever confirmation is absent, and meant to be shown verbatim: the
+    irreversible consequences, the cheaper things to try first, and the settings this submission
+    would actually use. The caller's job is to put this in front of the human and ask; consent to
+    'analyze this sample' is NOT consent to detonate it on someone else's infrastructure."""
+    policy = SUBMISSION_POLICY
+    privacy = policy.get("default_privacy", "owner")
+    return {
+        "action": "CONFIRMATION REQUIRED — nothing has been submitted",
+        "target": target,
+        "kind": kind,
+        "irreversible": True,
+        "why_it_is_gated": (
+            "A submission hands your case material to a third party AND touches the target from a "
+            "published sandbox egress range. Deleting the task afterwards un-sends nothing and "
+            "un-notifies nobody."),
+        "risks": list(policy.get("risks") or []),
+        "try_first": list(policy.get("preflight_checks") or []),
+        "would_use": {
+            "privacy": privacy,
+            "privacy_means": (PRIVACY_TYPES or {}).get(privacy, "unknown"),
+            "auto_delete_after": policy.get("default_auto_delete_after") or "(account default)",
+            "network": "enabled — a URL submission WILL fetch the live target",
+            **({"standing_public_authorization": (
+                "ANYRUN_ALLOW_PUBLIC=1 is set: if this plan cannot create a private task the "
+                "submission WILL be made PUBLIC (world-readable) instead of refused")}
+               if public_standing_authorized() else {}),
+        },
+        "never_send": list(policy.get("never_send") or []),
+        "to_proceed": ("ask the analyst explicitly, then call submit(..., confirm=True) — or "
+                       "`bp_anyrun.py submit <target> --confirm-submission` on the CLI"),
+    }
+
+
+def submit(target: str, kind: str = "file", *, confirm: bool = False, privacy: str = None,
+           timeout_s: int = None, auto_delete: str = None, allow_public: bool = False,
+           allow_unverified_plan: bool = False, tags: str = None, timeout: int = 120,
+           env_os: str = None):
+    """Detonate a file or URL in the ANY.RUN sandbox. **Refuses unless `confirm=True`.**
+
+    `confirm` is a function parameter rather than a config value on purpose: `submission_policy` in
+    the reference file can make the gate STRICTER, but nothing an analyst edits — or a stale copy
+    of the JSON — can turn it off. Without it you get `submit_preflight()` back and nothing is
+    sent.
+
+    Two more refusals that are not overridable by accident:
+      - `privacy='public'` (and anything in `forbidden_privacy`) needs `allow_public=True` on top
+        of `confirm`, because a public task is the failure mode that actually burns cases;
+      - `refuse_on_free_plan`: a plan with no private-submission entitlement must never turn
+        'it worked' into 'it went to the public feed instead'. `_plan_proves_private()` decides
+        pre-flight, in this order: (1) `/user` → `limits.private` — observed live, 0 in any
+        window ⇒ DENIED (positive evidence; `allow_unverified_plan` cannot override it), -1 or
+        positive everywhere ⇒ entitled; (2) block absent ⇒ the account's own record — a prior
+        non-public task proves it; (3) otherwise UNKNOWN, which FAILS CLOSED — the preflight comes
+        back with `plan_evidence` — unless the analyst attests to a paid plan with
+        `allow_unverified_plan=True` (CLI `--i-have-a-paid-plan`).
+        Defence-in-depth after the POST: `_verify_privacy()` polls the report (bounded) until the
+        task leaves "in progress", then reads the privacy ANY.RUN actually applied; a forbidden
+        mode is withdrawn and the result says `exposed: True`. If the task outlives the wait the
+        result carries `privacy_verified: None` + `verify_command`, and `verify_privacy()` /
+        `bp_anyrun.py verify-privacy <uuid>` finishes the check later — including the withdrawal.
+        Always "detected and withdrawn", never "prevented": deleting does not un-publish what the
+        feed already showed.
+
+    REQUIRES_ANALYST_CONFIRMATION — this marker is the token cti-expert's OPSEC gate
+    (tests/test_no_sample_submission.py) looks for. It is placed here, on the one function that can
+    reach the network with a sample, so the gate cannot be satisfied by a string sitting somewhere
+    harmless. The line below it is the enforcement the marker claims.
+    """
+    policy = SUBMISSION_POLICY
+    if not confirm:
+        return submit_preflight(target, kind)
+    if not anyrun_configured():
+        return {"skipped": "no ANYRUN_API_KEY configured — nothing submitted",
+                "capability": capability()}
+    privacy = (privacy or policy.get("default_privacy") or "owner").lower()
+    forbidden = [str(p).lower() for p in (policy.get("forbidden_privacy") or ["public"])]
+    # Standing analyst authorization for PUBLIC tasks — an explicit, durable, analyst-owned setting
+    # in the gitignored .env (same pattern as HARNESS_ALLOW_SUBMIT), for accounts whose plan can
+    # only create public tasks. It is the analyst's own word, so it counts exactly like passing
+    # allow_public=True on every call; it never touches the per-submission confirmation gate.
+    public_authorized_by = ("allow_public on this call" if allow_public
+                            else "ANYRUN_ALLOW_PUBLIC (standing .env authorization)"
+                            if public_standing_authorized() else None)
+    allow_public = public_authorized_by is not None
+    downgraded_from = None
+    if privacy in forbidden and not allow_public:
+        return {"refused": (f"privacy='{privacy}' is forbidden by submission_policy — that task "
+                            f"would be world-readable and searchable, and operators watch the "
+                            f"public feed. Pass allow_public=True ONLY if the analyst has said so "
+                            f"knowing that (or set ANYRUN_ALLOW_PUBLIC=1 in .env as a standing "
+                            f"authorization)."),
+                "target": target, "preflight": submit_preflight(target, kind)}
+    # A knowingly-PUBLIC submission (allow_public) has nothing to prove about private entitlement.
+    if privacy not in forbidden and policy.get("refuse_on_free_plan", True):
+        proof = _plan_proves_private(forbidden, timeout=min(timeout, 45))
+        verdict = proof.get("verdict")
+        if verdict == "denied":
+            if allow_public:
+                # The plan cannot go private and the analyst has authorized public: downgrade
+                # EXPLICITLY, and say so in the result — never silently.
+                downgraded_from, privacy = privacy, "public"
+            else:
+                # Positive evidence the plan CANNOT go private. An attestation cannot override a fact.
+                return {"refused": ("this key's plan has NO private-submission quota — ANY.RUN's own "
+                                    f"account record says so — so '{privacy}' would be public or "
+                                    "rejected and the operator can read the feed. Refused regardless "
+                                    "of allow_unverified_plan: that flag covers an UNPROVABLE plan, "
+                                    "not a proven free one. If a PUBLIC task is acceptable, the "
+                                    "analyst can say so with allow_public=True (or a standing "
+                                    "ANYRUN_ALLOW_PUBLIC=1 in .env)."),
+                        "plan_evidence": proof, "target": target,
+                        "preflight": submit_preflight(target, kind)}
+        elif verdict != "entitled" and not allow_unverified_plan:
+            return {"refused": ("no proof this key's plan can create a PRIVATE task — on a free plan "
+                                f"'{privacy}' becomes public and the operator can read the feed. "
+                                "submission_policy.refuse_on_free_plan fails closed. If the analyst "
+                                "attests to a paid sandbox plan, re-call with "
+                                "allow_unverified_plan=True (CLI --i-have-a-paid-plan); the applied "
+                                "privacy is still read back after the POST."),
+                    "plan_evidence": proof, "target": target,
+                    "preflight": submit_preflight(target, kind)}
+
+    body = {"obj_type": "url" if kind == "url" else "file",
+            "opt_privacy_type": privacy,
+            "opt_timeout": int(timeout_s or 120),
+            "opt_auto_delete_after": auto_delete or policy.get("default_auto_delete_after") or ""}
+    if env_os:
+        body["env_os"] = env_os
+    if tags:
+        # RULE 1 crossing an API boundary: a case identifier must not travel to a third party.
+        body["user_tags"] = tags
+    url = ENDPOINTS.get("api_base", "https://api.any.run/v1") + \
+        ENDPOINTS.get("submit_analysis", "/analysis")
+
+    if kind == "url":
+        body["obj_url"] = target
+        data, err = _call(url, method="POST", body=body, timeout=timeout)
+    else:
+        if not os.path.isfile(target):
+            return {"error": f"no such file: {target}"}
+        data, err = _post_multipart(url, body, target, timeout=timeout)
+    if err:
+        _record("submit", 0, f"{kind}:{target}", ok=False)
+        return dict(err, target=target, kind=kind)
+    uuid = ((data or {}).get("data") or {}).get("taskid") or (data or {}).get("taskid")
+    _record("submit", int(REQUEST_BUDGET.get("submit_costs", 1)), f"{kind}:{target}", results=1)
+    out = {"submitted": True, "task_uuid": uuid, "task_url": task_url(uuid or ""),
+           "privacy": privacy,
+           "note": ("Submitted. The target now knows it was fetched by a sandbox if this was a "
+                    "URL; treat any 'clean' verdict as possibly a decoy served to a datacenter IP."),
+           "raw": data if not uuid else None}
+    if privacy in forbidden:
+        out["public_task"] = True
+        out["public_authorized_by"] = public_authorized_by
+        out["public_note"] = ("This task is WORLD-READABLE and searchable: the file, its hash, "
+                              "screenshots and network log. Assume the operator can see it; do not "
+                              "submit anything carrying victim PII or a case identifier.")
+    if downgraded_from:
+        out["downgraded_from"] = downgraded_from
+        out["downgrade_reason"] = ("this key's plan has zero private quota (/user limits.private), "
+                                   "so the analyst's public authorization was applied instead of "
+                                   f"'{downgraded_from}'")
+    if uuid and policy.get("refuse_on_free_plan", True):
+        # Bounded to fit inside the harness's 300 s tool budget with the upload already spent.
+        wait_s = min(int(timeout_s or 120) + 60, 240)
+        out.update(_verify_privacy(uuid, privacy, forbidden, wait_s=wait_s, timeout=timeout))
+    return out
+
+
+def _task_privacy(task_uuid: str, timeout: int = 30):
+    """(privacy, error) for one own task, read off its report — `analysis.options.privacy` is the
+    one field the public connector schemas document for this; nothing else is assumed."""
+    base = ENDPOINTS.get("api_base", "https://api.any.run/v1")
+    url = base + ENDPOINTS.get("analysis_report", "/analysis/{id}").replace("{id}", str(task_uuid))
+    data, err = _call(url, timeout=timeout)
+    if err:
+        return None, err
+    rep = (data or {}).get("data") or data or {}
+    applied = (((rep.get("analysis") or {}).get("options") or {}).get("privacy")
+               or (rep.get("options") or {}).get("privacy"))
+    return (str(applied).lower() if applied else None), None
+
+
+def _plan_proves_private(forbidden: list, *, sample: int = 3, timeout: int = 30) -> dict:
+    """PRE-FLIGHT verdict on whether this key's plan can create a non-public task. Read-only,
+    unmetered, never raises. Returns `verdict` ∈ {"entitled", "denied", "unknown"} plus evidence:
+
+      1. `/user` → `data.limits.private.{minute,hour,day,month}` — OBSERVED on a live response
+         (2026-09; not in any public connector schema, so it is used only when present). ANY.RUN's
+         quota convention: -1 unlimited, 0 none, N remaining. Any window at 0 ⇒ "denied" (positive
+         evidence: `submit()` refuses even against an attestation). All windows -1/positive ⇒
+         "entitled".
+      2. Block absent → the account's own record: the `sample` most recent tasks' reports, accepting
+         only a positively recognised privacy value outside `forbidden` ⇒ "entitled".
+      3. Anything else — empty history, unreadable reports, only public tasks, transport error —
+         ⇒ "unknown", on which `submit()` fails closed unless the analyst attests."""
+    lim = user_limits(timeout=timeout)
+    priv_q = (lim or {}).get("limits", {}).get("private") if isinstance(lim, dict) else None
+    if isinstance(priv_q, dict) and priv_q:
+        windows = {k: v for k, v in priv_q.items() if isinstance(v, (int, float))}
+        if windows and any(v == 0 for v in windows.values()):
+            return {"verdict": "denied", "evidence": "/user limits.private has a zero window",
+                    "private_quota": windows}
+        if windows and all(v == -1 or v > 0 for v in windows.values()):
+            return {"verdict": "entitled", "evidence": "/user limits.private is non-zero in every window",
+                    "private_quota": windows}
+    hist = analysis_history(limit=max(1, sample), timeout=timeout) or {}
+    if "skipped" in hist or "error" in hist:
+        return {"verdict": "unknown", "reason": "history unreadable",
+                "detail": hist.get("skipped") or hist.get("error")}
+    tasks = [t.get("uuid") for t in (hist.get("tasks") or []) if t.get("uuid")]
+    if not tasks:
+        return {"verdict": "unknown", "reason": "no own tasks on record — a plan cannot be proven "
+                                                "from an empty history (a fresh paid account needs "
+                                                "the analyst's attestation once)"}
+    seen = {}
+    for uuid in tasks[:sample]:
+        priv, err = _task_privacy(uuid, timeout=timeout)
+        seen[uuid] = priv or (err or {}).get("skipped") or (err or {}).get("error") or "unreadable"
+        if priv and priv not in forbidden:
+            return {"verdict": "entitled", "evidence": f"own task {uuid} has privacy='{priv}'",
+                    "sampled": seen}
+    return {"verdict": "unknown", "reason": "no non-public task among the most recent own tasks",
+            "sampled": seen}
+
+
+def _task_record(task_uuid: str, timeout: int = 30):
+    """(status, privacy, error) for one own task off its report. `status` is the report's top-level
+    field — observed live as "in progress" while the sandbox runs (the record is then a stub with
+    no `analysis.options`) and "done" afterwards; `privacy` is `analysis.options.privacy`, the one
+    field the connector schemas document and the one validated on a real finished record."""
+    base = ENDPOINTS.get("api_base", "https://api.any.run/v1")
+    url = base + ENDPOINTS.get("analysis_report", "/analysis/{id}").replace("{id}", str(task_uuid))
+    data, err = _call(url, timeout=timeout)
+    if err:
+        return None, None, err
+    rep = (data or {}).get("data") or data or {}
+    applied = (((rep.get("analysis") or {}).get("options") or {}).get("privacy")
+               or (rep.get("options") or {}).get("privacy"))
+    status = str(rep.get("status") or "").lower() or None
+    return status, (str(applied).lower() if applied else None), None
+
+
+def _task_privacy(task_uuid: str, timeout: int = 30):
+    """(privacy, error) for one own task — see `_task_record`."""
+    _, priv, err = _task_record(task_uuid, timeout=timeout)
+    return priv, err
+
+
+def _verify_privacy(task_uuid: str, requested: str, forbidden: list, *, wait_s: int = 180,
+                    poll_s: float = 10.0, timeout: int = 30) -> dict:
+    """Read back the privacy ANY.RUN actually applied to a task, and withdraw the task if it is a
+    forbidden one.
+
+    Defence-in-depth behind `_plan_proves_private()` — and the only check left when the analyst
+    attested with `allow_unverified_plan`. The record carries no `analysis.options` while the task
+    is "in progress" (observed live), so this polls the report every `poll_s` until the status
+    leaves "in progress" or `wait_s` is spent. At submit time that wait is bounded; if it runs out
+    the result is `privacy_verified: None` plus `verify_command` — the analyst (or the model) runs
+    `bp_anyrun.py verify-privacy <uuid>` / `anyrun_submit(target=<uuid>, verify_task=true)` to
+    finish the job, including the withdrawal. Returns the keys merged into `submit()`'s result:
+      privacy_verified  True (matches) | False (mismatch) | None (record not readable in time)
+      privacy_applied   the value ANY.RUN reported, when readable
+      exposed, deleted, refused   only on a forbidden mismatch
+    Never raises; a verification failure is reported, not swallowed into a green result."""
+    base = ENDPOINTS.get("api_base", "https://api.any.run/v1")
+    tries = max(1, int(wait_s // max(poll_s, 1)))
+    status, applied, last_err = None, None, None
+    for attempt in range(tries):
+        # Per-poll transport timeout is capped so the wall-clock bound really is wait_s + one poll.
+        status, applied, err = _task_record(task_uuid, timeout=min(timeout, 30))
+        if err:
+            last_err = err
+        elif applied or status not in (None, "in progress"):
+            break
+        if attempt + 1 < tries:
+            time.sleep(poll_s)
+    if not applied:
+        return {"privacy_verified": None,
+                "privacy_note": ("could not read the applied privacy off the task record"
+                                 + (f" ({last_err})" if last_err else
+                                    f" — status is '{status}'; the record carries no options until "
+                                    "the task finishes")
+                                 + " — VERIFY before treating this task as private; on a free plan "
+                                 "it is public regardless of what was requested"),
+                "verify_command": f"bp_anyrun.py verify-privacy {task_uuid}",
+                "verify_tool_call": {"tool": "anyrun_submit",
+                                     "args": {"target": task_uuid, "verify_task": True, "wait": 0}}}
+    applied = str(applied).lower()
+    if applied == str(requested).lower() or applied not in forbidden:
+        return {"privacy_verified": applied == str(requested).lower(), "privacy_applied": applied}
+    # Forbidden mode applied: withdraw immediately. Deletion does not un-publish what was already
+    # visible, so the result says so instead of pretending the refusal was pre-emptive.
+    del_url = base + ENDPOINTS.get("delete_task", "/analysis/delete/{id}").replace("{id}", str(task_uuid))
+    _, del_err = _call(del_url, method="DELETE", timeout=timeout)
+    _record("submit-withdrawn", 0, f"task:{task_uuid}", ok=False)
+    return {"privacy_verified": False, "privacy_applied": applied, "exposed": True,
+            "deleted": del_err is None,
+            "refused": (f"ANY.RUN applied privacy='{applied}' although '{requested}' was requested — "
+                        f"this key's plan has no private-submission entitlement "
+                        f"(submission_policy.refuse_on_free_plan). The task was "
+                        + ("deleted" if del_err is None else f"NOT deleted ({del_err}) — delete it in the UI now")
+                        + ". It was world-readable for the interval before deletion; assume the "
+                        "operator may have seen the sample and treat the infrastructure as tipped.")}
+
+
+def verify_privacy(task_uuid: str, requested: str = None, *, wait_s: int = 0, timeout: int = 30) -> dict:
+    """Finish a submission's privacy read-back later — the follow-up `submit()` names in
+    `verify_command` when the task was still running at submit time. Reads the applied privacy and,
+    if it is a forbidden mode the analyst did not authorize (`requested` defaults to the policy
+    default, `owner`; pass 'public' for a knowingly public task), deletes the task and reports the
+    exposure — the same code path as the in-submit check. Nothing is submitted here."""
+    if not anyrun_configured():
+        return {"skipped": "no ANYRUN_API_KEY configured"}
+    policy = SUBMISSION_POLICY
+    requested = (requested or policy.get("default_privacy") or "owner").lower()
+    forbidden = [str(p).lower() for p in (policy.get("forbidden_privacy") or ["public"])]
+    public_ok = requested in forbidden or public_standing_authorized()
+    if public_ok:
+        forbidden = []          # the analyst authorized public: nothing to withdraw, only to report
+    out = {"task_uuid": task_uuid, "task_url": task_url(task_uuid), "requested": requested}
+    out.update(_verify_privacy(task_uuid, requested, forbidden, wait_s=wait_s, timeout=timeout))
+    if public_ok and out.get("privacy_applied") and out.get("privacy_verified") is False:
+        out["public_task"] = True
+        out["public_authorized_by"] = ("requested='public'" if requested in
+                                       [str(p).lower() for p in (policy.get("forbidden_privacy") or ["public"])]
+                                       else "ANYRUN_ALLOW_PUBLIC (standing .env authorization)")
+        out["note"] = (f"task is '{out['privacy_applied']}' rather than the requested '{requested}', "
+                       "which the analyst's public authorization permits — nothing withdrawn")
+    return out
+
+
+def _post_multipart(url: str, fields: dict, filepath: str, timeout: int = 120):
+    """Minimal multipart/form-data POST (stdlib only — BinaryPivot ships with no dependencies).
+
+    The filename sent is the basename as-is; strip case identifiers from it BEFORE calling, per
+    `submission_policy.never_send` — this function does not rename files behind the analyst's back,
+    because silently altering what was submitted is its own kind of surprise."""
+    import mimetypes
+    import uuid as _uuid
+    boundary = "----BinaryPivot" + _uuid.uuid4().hex
+    name = os.path.basename(filepath)
+    ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    parts = []
+    for k, v in (fields or {}).items():
+        if v in (None, ""):
+            continue
+        parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n"
+                     .encode())
+    try:
+        with open(filepath, "rb") as fh:
+            blob = fh.read()
+    except OSError as exc:
+        return None, {"error": f"cannot read {filepath}: {exc}"}
+    parts.append((f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+                  f"filename=\"{name}\"\r\nContent-Type: {ctype}\r\n\r\n").encode())
+    parts.append(blob)
+    parts.append(f"\r\n--{boundary}--\r\n".encode())
+    payload = b"".join(parts)
+    headers = _headers()
+    headers["Content-Type"] = f"multipart/form-data; boundary={boundary}"
+    try:
+        req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r), None
+    except urllib.error.HTTPError as e:
+        reason = _STATUS_REASON.get(e.code)
+        msg = f"HTTP {e.code}" + (f" — {reason}" if reason else "")
+        return None, ({"skipped": msg} if e.code in _STATUS_REASON else {"error": msg})
+    except Exception as e:
+        return None, {"error": str(e)}
+
+
+def user_limits(timeout: int = 20):
+    """The sandbox account's own limits — what is left of the plan."""
+    if not anyrun_configured():
+        return None
+
+    def run():
+        url = ENDPOINTS.get("api_base", "https://api.any.run/v1") + \
+            ENDPOINTS.get("user_limits", "/user")
+        data, err = _call(url, timeout=timeout)
+        return dict(err) if err else ((data or {}).get("data") or data)
+    return _memoised("user_limits", "self", run)
+
+
+# --------------------------------------------------------------------------- run enrichment
+# Priority for spending a bounded allowance across one artifact's pivots. The file hash first — it
+# is the question "has anyone already detonated THIS sample", and one answer to it can replace the
+# whole rest of the lookup. Then the endpoints the sample talks to, which is where new
+# infrastructure comes from.
+_ENRICH_PRIORITY = ["file:sha256", "app:c2_endpoint", "app:backend_host", "url"]
+
+
+def _priority(kind: str) -> int:
+    for i, k in enumerate(_ENRICH_PRIORITY):
+        if kind == k:
+            return i
+    return len(_ENRICH_PRIORITY)
+
+
+def enrich_result(result: dict, max_lookups: int = None, days: int = None) -> dict:
+    """Run ANY.RUN TI Lookup over a finished BinaryPivot result and fold what comes back into it.
+
+    Each looked-up pivot gets its observations on `pivot['live_results']['anyrun']`; the run summary
+    lands on `result['anyrun']`, including the hosts the sandbox saw contacted that this static
+    analysis did not find — the point of the layer on a packed sample.
+
+    Keyless: nothing is queried and `result['anyrun']` carries the capability statement instead, so
+    the case file records that the observation index was NOT consulted."""
+    cap = capability()
+    if not anyrun_configured():
+        result["anyrun"] = {"capability": cap, "looked_up": []}
+        return result["anyrun"]
+
+    b = budget_status()
+    room = max(0, b["max_requests_per_run"] - b["spent_this_run"])
+    limit = min(int(max_lookups or room), room)
+    out = {"capability": cap, "looked_up": [], "skipped_for_budget": [], "new_infrastructure": []}
+    static_hosts = set()
+    for piv in result.get("pivots") or []:
+        if piv.get("kind") in ("app:backend_host", "app:c2_endpoint"):
+            static_hosts.add(str(piv.get("value") or "").split(":")[0].lower())
+
+    for piv in sorted(result.get("pivots") or [], key=lambda p: _priority(p.get("kind", ""))):
+        if not build_query(piv.get("kind"), piv.get("value")):
+            continue
+        if limit <= 0:
+            out["skipped_for_budget"].append(f"{piv.get('kind')}={piv.get('value')}")
+            continue
+        hits = lookup_artifact(piv.get("kind"), piv.get("value"), days=days)
+        if not isinstance(hits, dict):
+            continue
+        limit -= 1
+        piv.setdefault("live_results", {})["anyrun"] = hits
+        out["looked_up"].append({"kind": piv.get("kind"), "value": piv.get("value"),
+                                 "domains": len(hits.get("domains") or []),
+                                 "ips": len(hits.get("ips") or []),
+                                 "threat_names": hits.get("threat_names") or [],
+                                 "skipped": hits.get("skipped")})
+        # Anything the sandbox saw contacted that the strings sweep did NOT find is the layer
+        # earning its keep — on a packed sample that is where the operator's real endpoints are.
+        for host in (hits.get("domains") or []):
+            h = str(host).lower()
+            if h and h not in static_hosts:
+                out["new_infrastructure"].append(h)
+    out["new_infrastructure"] = uniq(out["new_infrastructure"])[
+        :int(RESULT_LIMITS.get("max_related_indicators", 100))]
+    if out["new_infrastructure"]:
+        out["note"] = ("Hosts observed in detonations that are NOT in this file's static strings. "
+                       "They are collection targets for WebPivot — corroborate before treating any "
+                       "of them as the operator's own.")
+    if out["skipped_for_budget"]:
+        out["budget_note"] = (f"{len(out['skipped_for_budget'])} artifact(s) were NOT looked up — "
+                              f"the per-run cap was reached. That absence is a budget fact, not a "
+                              f"finding.")
+    result["anyrun"] = out
+    return out
+
+
+# --------------------------------------------------------------------------- capability statement
+def capability() -> dict:
+    """What THIS run's ANY.RUN layer can do — same contract as WebPivot's `wp_capabilities`, so the
+    statement drops straight into an assessment's collection-limitations note.
+
+    The percentage is blunt on purpose. Keyless, the layer still writes the correct query for every
+    artifact and points at the UI that runs it — genuinely half the job, since choosing the right
+    observation field is the tradecraft. What it cannot do is EXECUTE any of them, so no sandbox
+    observation ever reaches the case file automatically and no negative is ever established."""
+    if anyrun_key() and ENABLED:
+        return {"layer": "anyrun", "mode": "keyed", "power_pct": 100,
+                "available": ["TI Lookup over detonation observations (contacted domains/IPs/URLs)",
+                              "family + Suricata context and the public task links",
+                              "runtime infrastructure a packed sample never reveals statically"],
+                "unavailable": [],
+                "statement": "ANY.RUN TI Lookup queried live — sandbox-observed infrastructure for "
+                             "every artifact the sandbox indexes."}
+    return {
+        "layer": "anyrun", "mode": "keyless", "power_pct": 50,
+        "available": ["the correct TI Lookup query for every indexable artifact (right observation "
+                      "field, ip:port split, bounded time window)",
+                      "the TI Lookup UI address to paste it into, plus public-task links",
+                      "the clustering policy that says what a hit would and would not prove"],
+        "unavailable": ["the observations themselves — contacted domains, IPs, URLs and ports",
+                        "the threat/family label and Suricata context",
+                        "the runtime backend hosts a PACKED sample hides from static extraction",
+                        "any automatic feedback of discovered infrastructure into the case"],
+        "statement": ("COLLECTION LIMITATION — ANY.RUN ran at roughly HALF capability: no "
+                      "ANYRUN_API_KEY is configured, so the TI Lookup queries were BUILT but never "
+                      "EXECUTED. This run establishes nothing about what this sample or its "
+                      "infrastructure did when detonated — that index was not queried. This "
+                      "matters most on a PACKED sample, whose real endpoints only exist at "
+                      "runtime. Run the emitted queries in the TI Lookup UI, or set "
+                      "ANYRUN_API_KEY."),
+    }
+
+
+def banner_lines() -> list:
+    """The stderr block for a keyless ANY.RUN layer. Empty when keyed."""
+    cap = capability()
+    if cap["power_pct"] >= 100:
+        return []
+    return [
+        f"[!] ANY.RUN: KEYLESS — ~{cap['power_pct']}% capability.",
+        f"    lost:    {cap['unavailable'][0]}; {cap['unavailable'][2]}",
+        f"    instead: {cap['available'][0]}",
+        f"    get a key: {UI_TEMPLATES.get('api_key_tab') or UI_TEMPLATES.get('signup')}",
+    ]
+
+
+__all__ = ["anyrun_key", "anyrun_configured", "field_for_kind", "build_query", "anyrun_queries",
+           "attach_anyrun_queries", "task_url", "grade_field", "summarise_lookup", "ti_lookup",
+           "lookup_artifact", "enrich_result", "keycheck", "user_limits", "capability",
+           "banner_lines", "analysis_history", "analysis_report", "submit", "submit_preflight",
+           "verify_privacy", "public_standing_authorized",
+           "budget_status", "month_spent", "ENDPOINTS", "QUERY_FIELDS", "PIVOT_FIELD_MAP",
+           "PLAN_CAPABILITIES", "REQUEST_BUDGET", "RESULT_LIMITS", "UI_TEMPLATES",
+           "CLUSTERING_POLICY", "SUBMISSION_POLICY", "PRIVACY_TYPES"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description="ANY.RUN TI Lookup + keyless query builder")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("lookup", help="run a TI Lookup (1 request)")
+    p.add_argument("--sha256")
+    p.add_argument("--md5")
+    p.add_argument("--domain")
+    p.add_argument("--ip", help="IP or IP:port")
+    p.add_argument("--url")
+    p.add_argument("--query", help="raw TI Lookup query, e.g. 'domainName:\"example.com\"'")
+    p.add_argument("--days", type=int, default=None)
+    p = sub.add_parser("query", help="OFFLINE: build the TI Lookup query for a pivot kind (no key)")
+    p.add_argument("kind", help="BinaryPivot pivot kind, e.g. file:sha256, app:backend_host")
+    p.add_argument("value")
+    p = sub.add_parser("history", help="YOUR OWN past sandbox tasks (read-only)")
+    p.add_argument("--limit", type=int, default=25)
+    p = sub.add_parser("report", help="one task's report (read-only)")
+    p.add_argument("task_uuid")
+    p.add_argument("--iocs", action="store_true", help="the task's IOC set instead of the report")
+    p = sub.add_parser("submit", help="DETONATE a file/URL — prints the risk briefing and REFUSES "
+                                      "unless --confirm-submission is given")
+    p.add_argument("target", help="local file path, or a URL with --url")
+    p.add_argument("--url", action="store_true", help="submit TARGET as a URL to browse, not a file")
+    p.add_argument("--confirm-submission", action="store_true",
+                   help="I have asked the analyst and they authorized THIS submission. Without it "
+                        "nothing is sent — you get the briefing instead.")
+    p.add_argument("--privacy", default=None,
+                   choices=sorted(PRIVACY_TYPES.keys()) or None,
+                   help="who can see the task (default: owner — only you)")
+    p.add_argument("--allow-public", action="store_true",
+                   help="permit a PUBLIC task. Operators watch the public feed; this is the option "
+                        "that burns cases, so it is separate from --confirm-submission")
+    p.add_argument("--i-have-a-paid-plan", dest="allow_unverified_plan", action="store_true",
+                   help="analyst attestation that this key is on a paid sandbox plan (private tasks "
+                        "allowed). Needed only when the account's own history cannot prove it — e.g. "
+                        "a fresh account. The applied privacy is still read back after the POST.")
+    p.add_argument("--sandbox-timeout", type=int, default=None, metavar="SECONDS")
+    p.add_argument("--tags", default=None,
+                   help="ANY.RUN user tags — NEVER put a case ID or an analyst/client name here")
+    p.add_argument("--env-os", default=None, choices=["windows", "android"],
+                   help="sandbox OS (default: windows)")
+    vp = sub.add_parser("verify-privacy",
+                        help="finish a submission's privacy read-back once the task has run: reads "
+                             "the applied privacy and withdraws a task that landed in a forbidden "
+                             "mode (nothing is submitted)")
+    vp.add_argument("task_uuid")
+    vp.add_argument("--requested", default=None, choices=sorted(PRIVACY_TYPES.keys()) or None,
+                    help="the privacy that was requested at submit time (default: policy default)")
+    vp.add_argument("--wait", type=int, default=0, metavar="SECONDS",
+                    help="poll this long for the task to finish before giving up (default 0: one read)")
+    kc = sub.add_parser("keycheck",
+                        help="TI-Lookup licence check (advisory; add --probe to settle it "
+                             "authoritatively — free unless entitled)")
+    kc.add_argument("--probe", action="store_true",
+                    help="issue the real /intelligence search: free if not entitled (403), "
+                         "costs 1 request only if it is")
+    sub.add_parser("limits", help="the sandbox account's remaining plan limits")
+    sub.add_parser("budget", help="OFFLINE: this month's ANY.RUN request spend (no key, no spend)")
+    args = ap.parse_args()
+
+    if args.cmd == "query":
+        q = build_query(args.kind, args.value)
+        out = {"kind": args.kind, "field": field_for_kind(args.kind), "query": q,
+               "queries": anyrun_queries(args.kind, args.value), "capability": capability()}
+        if not q:
+            out["note"] = ("ANY.RUN indexes DETONATION OBSERVATIONS — hashes, contacted domains/"
+                           "IPs/URLs, JARM. A signing certificate, an APK package name or a "
+                           "firebase project id is not an observation field; reverse those on "
+                           "VirusTotal / Koodous / Triage instead.")
+    elif args.cmd == "budget":
+        out = budget_status()
+        out["note"] = (f"A TI Lookup costs {REQUEST_BUDGET.get('lookup_costs', 1)} request. "
+                       f"Counted from the shared ledger across every case.")
+    elif args.cmd == "submit" and not args.confirm_submission:
+        # The briefing path is OFFLINE and works with no key: an analyst must be able to read what
+        # a submission would cost them before deciding, and before wiring up a credential.
+        pf = submit_preflight(args.target, "url" if args.url else "file")
+        print(json.dumps(pf, indent=2, ensure_ascii=False))
+        print("\n[anyrun] NOTHING WAS SUBMITTED. Show the risks above to the analyst and get an "
+              "explicit yes, then re-run with --confirm-submission.", file=sys.stderr)
+        return 3
+    elif not anyrun_configured():
+        cap = capability()
+        print(
+            "ANY.RUN: KEYLESS — no ANYRUN_API_KEY configured. Capability ~50%.\n"
+            "  UNAVAILABLE (needs a key): " + "; ".join(cap["unavailable"]) + ".\n"
+            "    Nothing was queried, so nothing being reported is NOT a finding about the sample.\n"
+            "  STILL AVAILABLE, keyless and free: " + "; ".join(cap["available"]) + ".\n"
+            f"  Get a key: {UI_TEMPLATES.get('api_key_tab')}, then\n"
+            "    `printf 'ANYRUN_API_KEY=…\\n' >> .env && chmod 600 .env`.\n"
+            "  NOTE: TI Lookup is a separate licence from the sandbox — settle it with `keycheck --probe`.\n"
+            "  Detail: BinaryPivot/SKILL.md § ANY.RUN",
+            file=sys.stderr)
+        return 2
+    elif args.cmd == "keycheck":
+        out = keycheck(probe=getattr(args, "probe", False))
+    elif args.cmd == "limits":
+        out = user_limits()
+    elif args.cmd == "history":
+        out = analysis_history(limit=args.limit)
+    elif args.cmd == "report":
+        out = analysis_report(args.task_uuid, iocs=args.iocs)
+    elif args.cmd == "verify-privacy":
+        out = verify_privacy(args.task_uuid, args.requested, wait_s=args.wait)
+    elif args.cmd == "submit":
+        out = submit(args.target, "url" if args.url else "file", confirm=True,
+                     privacy=args.privacy, timeout_s=args.sandbox_timeout,
+                     allow_public=args.allow_public, allow_unverified_plan=args.allow_unverified_plan,
+                     tags=args.tags, env_os=args.env_os)
+    else:
+        if args.query:
+            out = ti_lookup(args.query, days=args.days)
+        else:
+            pairs = [("file:sha256", args.sha256), ("file:md5", args.md5),
+                     ("domain", args.domain), ("ip", args.ip), ("url", args.url)]
+            terms = [build_query(k, v) for k, v in pairs if v]
+            terms = [t for t in terms if t]
+            if not terms:
+                print("lookup needs at least one of --sha256/--md5/--domain/--ip/--url/--query",
+                      file=sys.stderr)
+                return 2
+            out = ti_lookup(" AND ".join(terms), days=args.days)
+    print(json.dumps(out, indent=2, ensure_ascii=False))
+    if args.cmd not in ("query", "budget"):
+        b = budget_status()
+        print(f"[anyrun] spent {b['spent_this_run']} request(s) this run · "
+              f"{b['remaining_this_month']}/{b['monthly_requests']} left for {b['month']}",
+              file=sys.stderr)
+    if api_usage:
+        api_usage.print_session_summary()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

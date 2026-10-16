@@ -1,0 +1,82 @@
+# Claude Code session state
+.claude/
+.codex/config.toml
+.codex/config.toml.bak-*
+/validation/local-review.*
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# OSINT report outputs (generated at runtime)
+osint-reports/
+OSINT-REPORT-*
+CTI-REPORT-*
+# ...but NOT the HTML report template: on case-insensitive filesystems (Windows/macOS)
+# the CTI-REPORT-* rule above otherwise swallows scripts/cti-report-template.html.
+!scripts/cti-report-template.html
+plans/
+
+# Runtime-installed third-party tools (cloned by the installer)
+vendor/
+
+# Virtual environments
+.venv/
+
+# API keys (managed by /apikeys) — NEVER commit
+.env
+.env.*
+!.env.example
+scripts/**/.env
+scripts/**/.env.*
+# Credential and signing material — local only
+*.pem
+*.key
+*.p12
+*.pfx
+.secrets/
+# Egress proxy pool (managed by /proxy) — may hold proxy credentials; never commit
+scripts/proxy/proxies.json
+scripts/proxy/.rotation-state
+scripts/proxy/.proxy-health
+
+# Local intel-backend MCP registration (absolute path, machine-specific).
+# Written by `scripts/backend/intel.py mcp --write` to enable Tier 1 — never commit.
+.mcp.json
+
+# Vendored intel-engine runtime DATA (fresh, local-only — never commit)
+/intel_engine/cases/
+# Defensive: the ONE case store is /intel_engine/cases/ (INTEL_HOME/cases). A repo-root
+# cases/ is always a mistake — someone running a collector with `-o cases/...` from the
+# repo root instead of letting the pipeline choose the path. Ignore it so case data can
+# never be committed by accident.
+/cases/
+# Defensive: stray case seed/scratch/output files dropped at the intel_engine root (e.g.
+# CASE-YYYYMMDD-NN-seeds.txt, .json, .csv, .md) are case data and slip past /cases/. Ignore them.
+/intel_engine/CASE-*
+/intel_engine/MEMORY/
+/intel_engine/knowledge/entities/
+/intel_engine/knowledge/evidence/
+/intel_engine/knowledge/analyst_profile.md
+/intel_engine/knowledge/relationships/edges.jsonl
+/intel_engine/knowledge/*.jsonl
+# The IntelAnalysis output contract writes assessments to knowledge/reports/<case>/ — that path
+# holds finished case data (domains, IPs, registrants, wallets) and was NOT ignored, so a run
+# following the skill's own instructions left a committable RULE 1 leak. Ignore it too. Note the
+# ONE case store is still /intel_engine/cases/; prefer writing assessments there.
+/intel_engine/knowledge/reports/
+# Repo-root MEMORY/ — Algorithm PRDs belong in ~/.claude/MEMORY/, never in the repo.
+/MEMORY/
+
+# guard: KB/case stores must live under intel_engine/, never the repo root (RULE 2)
+/knowledge/
+/cases/
+.subfinder-provider-config.yaml
+
+# Runtime report drops (real case PDFs/DOCX) — private, never tracked (RULE 2 / synthetic-only).
+.orca/
