@@ -34,6 +34,22 @@ Atau berikan target langsung saat menjalankan launcher:
 
 Codex mengenali jenis target seperti username atau domain; username yang jelas tidak perlu melewati pilihan jenis 1–8. Kalau target atau tujuannya ambigu, Codex akan meminta detail yang memang diperlukan.
 
+## Referensi command proyek
+
+Repository ini juga menyimpan **9 registered slash commands** dari command layer proyek asal. Untuk alur Codex pada beta ini, gunakan launcher atau skill `$cti-expert:cti`; berkas command berikut tetap disertakan sebagai referensi pipeline:
+
+| Berkas | Fungsi |
+|---|---|
+| [`cti.md`](commands/cti.md) | Entry point investigasi target. |
+| [`cti-case.md`](commands/cti-case.md) | Menjalankan pipeline pada case dan seed. |
+| [`cti-check.md`](commands/cti-check.md) | Memeriksa indikator dan false positive. |
+| [`cti-cluster.md`](commands/cti-cluster.md) | Memperluas dan mengorelasikan case. |
+| [`cti-pivot.md`](commands/cti-pivot.md) | Mengumpulkan pivot dari satu target. |
+| [`cti-proxy.md`](commands/cti-proxy.md) | Mengatur proxy egress proyek. |
+| [`cti-recall.md`](commands/cti-recall.md) | Memeriksa apakah seed muncul di case sebelumnya. |
+| [`cti-report.md`](commands/cti-report.md) | Merender graph dan laporan case. |
+| [`cti-status.md`](commands/cti-status.md) | Memeriksa kesehatan backend dan case store. |
+
 ## Menggunakan Codex desktop
 
 Buka folder repository ini sebagai project di Codex, selesaikan prompt trust jika muncul, lalu kirim:
